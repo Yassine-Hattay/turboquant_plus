@@ -30,7 +30,7 @@ def load_model():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.float32,  # fp32 for accuracy baseline
+        dtype=torch.float32,  # fp32 for accuracy baseline
         device_map="cpu",  # CPU is fine for validation
         trust_remote_code=True,
     )
@@ -51,13 +51,21 @@ def extract_kv_cache(model, tokenizer, prompt: str) -> dict:
 
     past_kv = outputs.past_key_values
 
-    # Stack into tensors: (num_layers, num_kv_heads, seq_len, head_dim)
+    # Handle both old tuple format and new DynamicCache format
     k_tensors = []
     v_tensors = []
-    for layer_kv in past_kv:
-        k, v = layer_kv
-        k_tensors.append(k.squeeze(0).numpy())  # remove batch dim
-        v_tensors.append(v.squeeze(0).numpy())
+
+    if hasattr(past_kv, 'key_cache'):
+        # New DynamicCache format (transformers >= 4.36)
+        for i in range(len(past_kv.key_cache)):
+            k_tensors.append(past_kv.key_cache[i].squeeze(0).numpy())
+            v_tensors.append(past_kv.value_cache[i].squeeze(0).numpy())
+    else:
+        # Old tuple-of-tuples format
+        for layer_kv in past_kv:
+            k, v = layer_kv[0], layer_kv[1]
+            k_tensors.append(k.squeeze(0).numpy())
+            v_tensors.append(v.squeeze(0).numpy())
 
     k_cache = np.stack(k_tensors)  # (num_layers, num_kv_heads, seq_len, head_dim)
     v_cache = np.stack(v_tensors)
