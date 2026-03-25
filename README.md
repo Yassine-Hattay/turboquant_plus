@@ -21,21 +21,19 @@ Compresses transformer KV cache **up to 4.9×** using PolarQuant + QJL. Paper cl
 
 ### Qwen 3.5 35B-A3B MoE (Q8_0)
 
-| Cache Type | Bits/val | Prompt tok/s | Gen tok/s | KV Compression |
-|------------|----------|-------------|-----------|----------------|
-| q8_0 (baseline) | 8.0 | **222.8** | **85.5** | 2.0× |
-| turbo4 | 4.25 | 62.6 | 10.3 | 3.8× |
-| turbo3 | 3.25 | 67.3 | 10.7 | **4.9×** |
+| Cache Type | Bits/val | Prompt tok/s | Gen tok/s | KV Compression | vs q8_0 |
+|------------|----------|-------------|-----------|----------------|---------|
+| q8_0 (baseline) | 8.0 | **222.8** | **85.5** | 2.0× | 1.00× |
+| turbo3 | 3.25 | 160.3 | **51.4** | **4.9×** | 0.60× |
 
 ### Qwopus v2 27B Dense (Q8_0)
 
-| Cache Type | Bits/val | Prompt tok/s | Gen tok/s | KV Compression |
-|------------|----------|-------------|-----------|----------------|
-| q8_0 (baseline) | 8.0 | **83.1** | **17.6** | 2.0× |
-| turbo4 | 4.25 | 24.3 | 5.2 | 3.8× |
-| turbo3 | 3.25 | 29.8 | 5.3 | **4.9×** |
+| Cache Type | Bits/val | Prompt tok/s | Gen tok/s | KV Compression | vs q8_0 |
+|------------|----------|-------------|-----------|----------------|---------|
+| q8_0 (baseline) | 8.0 | **83.1** | **17.6** | 2.0× | 1.00× |
+| turbo3 | 3.25 | 67.5 | **14.6** | **4.9×** | **0.83×** |
 
-> **Speed**: turbo3 is currently ~3-8× slower than q8_0 on generation due to WHT rotation in the dequant path. Speed ceiling test (rotation removed) shows **49.1 tok/s** (57% of q8_0) — achievable via pre-rotate-queries optimization which moves rotation from per-KV-position to per-query. Implementation in progress ([#23](https://github.com/TheTom/turboquant_plus/issues/23)).
+> **Speed**: With pre-rotate-queries optimization, turbo3 runs at **60-83% of q8_0 speed** while providing **4.9× KV cache compression**. The dense 27B model at 14.6 tok/s is practical for long-context inference where memory is the bottleneck.
 
 ### Compression Quality (Python Prototype)
 
@@ -207,7 +205,7 @@ benchmarks/
 | Real model validation | ✅ | Rotation validated on Qwen3 KV tensors (kurtosis 900→2.9) |
 | llama.cpp C port | ✅ | Metal GPU inference working on M5 Max |
 | Benchmarks (v1) | ✅ | MoE + Dense, 4 cache types each |
-| Metal shader optimization | 🔄 | Pre-rotate-queries: 10.7→49 tok/s target ([#23](https://github.com/TheTom/turboquant_plus/issues/23)) |
+| Metal shader optimization | ✅ | Pre-rotate-queries: 10.7→51.4 tok/s MoE, 5.3→14.6 Qwopus ([#23](https://github.com/TheTom/turboquant_plus/issues/23)) |
 | Benchmark hardening | 🔄 | Perplexity, NIAH, multi-run ([#24](https://github.com/TheTom/turboquant_plus/issues/24)) |
 | TurboQuant+ extensions | ⏳ | Adaptive bits, temporal decay, MoE-aware compression |
 | MLX port | ⏳ | Last |
