@@ -17,6 +17,9 @@ bench = [
     "matplotlib",
 ]
 
+[tool.setuptools.packages.find]
+include = ["turboquant*"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
