@@ -202,6 +202,55 @@ KV cache sizing at multiple context lengths. If the system is near its `recommen
 | Decode ratio (32K context) | ~0.75x | Gradual degradation, still usable |
 | PPL delta vs q8_0 | < 2% | Typically < 1% |
 
+### M1 Max 64GB Community Results (Qwen 35B MoE Q8_0)
+
+*Contributor: @Ambisphaeric (2026-03-26). GPU: Apple M1 Max, 32 cores, 64GB unified.*
+
+**Prefill (tok/s):**
+
+| Context | q8_0 | turbo3 | Ratio |
+|---------|------|--------|-------|
+| 2K | 855.7 | 836.1 | 0.977x |
+| 4K | 805.2 | 784.0 | 0.974x |
+| 8K | 724.6 | 696.3 | 0.961x |
+| 16K | 600.5 | 569.6 | 0.949x |
+| 32K | 444.9 | 414.0 | 0.931x |
+
+Prefill is excellent: 93–98% of q8_0, flat curve, no regression.
+
+**Decode (tok/s, tg128):**
+
+| Context | q8_0 | turbo3 | Ratio | Flag |
+|---------|------|--------|-------|------|
+| short | 41.2 | 34.5 | 0.837x | |
+| 4K | 31.9 | 20.4 | 0.640x | |
+| 8K | 27.5 | 14.8 | 0.538x | |
+| 16K | 20.7 | 9.4 | 0.454x | ANOMALY |
+| 32K | 13.7 | 5.3 | 0.387x | ANOMALY |
+
+Decode degrades significantly at long context. Known M1 issue: constant memory LUT contention in the flash attention dequant path. M5 Max (with tensor API) does not have this problem.
+
+**Anomalies detected:**
+- Steep decode degradation: 0.824x → 0.600x at 4K (27% drop)
+- Steep decode degradation: 0.513x → 0.426x at 16K (17% drop)
+
+### M2 Pro 32GB (Mac Mini) Results (Qwen2.5-7B Q4_K_M) — In Progress
+
+*Internal test (2026-03-26). GPU: Apple M2 Pro, Apple8 family, has_tensor=false.*
+
+Partial prefill results (competing workloads on device):
+
+| Context | q8_0 | turbo3 | Ratio |
+|---------|------|--------|-------|
+| 2K | 248.8 | 140.5 | 0.564x |
+| 4K | 230.0 | 131.1 | 0.570x |
+| 8K | 184.2 | 151.0 | 0.820x |
+| 16K | 135.5 | 111.5 | 0.823x |
+
+High variance due to competing workloads. Full results pending.
+
+---
+
 ### What "Good" vs "Bad" Looks Like
 
 | Indicator | Good | Bad |
