@@ -271,6 +271,32 @@ This explains the ranking pattern: approaches that maintain per-element `read �
 
 **The remaining 38% gap cannot be closed by rearranging the same reads and ALU.** The only path forward is reducing the total constant read count per element below 4, which requires changing the block format or computation structure.
 
+## Untested Approaches (Hitlist)
+
+These are approaches that have NOT been tried yet. Work through them in order.
+
+| # | Approach | Category | Rationale | Expected Impact | Status |
+|---|----------|----------|-----------|----------------|--------|
+| 16 | `half cn[8]` register LUT | Register LUT | 16 bytes instead of 32 float. May not spill on Apple8's smaller register file. If it fits, eliminates constant memory entirely. | High if it fits | NOT TESTED |
+| 17 | Device-memory centroid×norm | Block format change | Store 8 precomputed `centroid[i] × norm` per 128-element group in device memory. Sequential reads (no divergence). Adds 16 bytes per block (3.5→4.5 bits/val, still 1.78x compression). Preserves ILP (still per-element read → multiply pattern). | High — eliminates constant memory while preserving ILP | NOT TESTED |
+| 18 | Byte-indexed 256-entry LUT | LUT restructure | Pack all 8 centroid×sign combinations into a 256-byte lookup indexed by raw byte value. 4x fewer lookups (1 per byte instead of 1 per element). Trades constant memory bandwidth for fewer accesses. | Medium — fewer reads but larger LUT may thrash cache worse | NOT TESTED |
+| 19 | Threadgroup centroid cache (real Metal, not CPU fallback) | Threadgroup memory | Previous threadgroup test was during CPU fallback bug. Retest: load cn[8] into threadgroup once per threadgroup, all threads read from SMEM. Unlike SMEM pre-dequant (which cached dequanted VALUES), this caches the CENTROID TABLE. Much smaller (32 bytes), no per-element stores. | Medium — depends on threadgroup read latency vs constant read | NOT TESTED |
+| 20 | 2-bit direct encode (no LUT) | Format change | Redesign turbo3 to use 2-bit uniform quantization per element (scale + offset per block). No centroid LUT at all. Reconstruction = `scale * idx + offset`. Same bits, zero divergent reads. Quality may suffer vs PolarQuant centroids. | Unknown — eliminates the problem entirely but may hurt quality | NOT TESTED |
+| 21 | Hybrid 4-mag + simd_shuffle | Combined | Use 4-mag for magnitude (4 constant reads), then simd_shuffle for sign propagation instead of XOR. May reduce 1-2 ALU ops. | Low — simd_shuffle was only -2.6% vs 4-mag alone | NOT TESTED |
+| 22 | Async device copy to threadgroup | Pipeline | Use Metal's async copy to prefetch next tile of KV blocks into threadgroup while computing current tile. Hides device memory latency. | Medium — requires restructuring tile loop | NOT TESTED |
+
+### Priority order
+1. **#16 half cn[8]** — fastest to test, highest upside if registers don't spill
+2. **#17 Device-memory centroid×norm** — most architecturally sound, eliminates root cause
+3. **#19 Threadgroup centroid cache** — quick test, small change
+4. **#18 Byte-indexed 256-entry LUT** — worth a shot
+5. **#20-22** — only if above fail
+
+### Success criteria
+- Any approach that gets M2 8K decode from 15.1 to 18+ tok/s is a win
+- Anything that gets to 20+ tok/s (matching the no-dequant ceiling for q8_0) is a huge win
+- The theoretical ceiling is 24.5 tok/s (no dequant at all)
+
 ## M5 Max Long-Context Discovery (2026-03-27)
 
 ### The constant cache bottleneck hits M5 Max too at long context

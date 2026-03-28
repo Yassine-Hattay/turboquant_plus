@@ -23,11 +23,15 @@ Hardware: Apple M5 Max 128GB. All tests with sparse V enabled.
 | Qwen 27B Dense | 128 | 6.89 | 6.94 | +0.72% | 7.01 | 0.99x | ✅ |
 | Phi-4 | 128 | 6.00 | 6.10 | +1.68% | 6.23 | 0.91x | ✅ |
 | Mistral Small 24B | 128 | 6.09 | 6.12 | +0.46% | 6.28 | 0.86x | ✅ |
-| Mixtral 8x7B MoE | 128 | — | — | — | — | — | PENDING |
-| Gemma 2 27B | **256** | 7.06 | **BROKEN** | 🔴 | **BROKEN** | — | 🔴 |
-| Llama 3.1 70B | 128 | — | — | — | — | — | PENDING |
+| Gemma 2 27B (ISWA) | 128 | 3.75 | 3.79 | +0.9% | 3.80 | — | — |
+| Llama 3.1 70B | 128 | 2.44 | 2.64 | +8.3% | 2.79 | 0.94x | ✅ |
+| Mixtral 8x7B MoE | 128 | — | — | — | — | — | skipped (bad GGUF) |
 
-**Key finding:** All hd128 models work. hd256 (Gemma 2) is catastrophically broken. turbo4 consistently closer to q8_0 than turbo3 across all working models.
+**Key findings:**
+- All hd128 models work across 4 families (Qwen, Meta, Google, Microsoft, Mistral)
+- turbo4 consistently closer to q8_0 than turbo3
+- Gemma 2 (ISWA) **FIXED** — was missing WHT rotation in ISWA build_attn overload (PPL 13.7T → 3.80)
+- Llama 70B shows higher PPL gap (+8.3%) — likely Q4_K_M weight quant stacking with KV quant
 
 ## Results
 
@@ -52,17 +56,21 @@ Already validated extensively. See README and turbo4-resurrection.md.
 
 ⚠️ **GGUF incompatible** — `second-state` repo uses old format, missing `ffn_down_exps` tensor. Need bartowski or official Mixtral GGUF. Skipped.
 
-### Model 4: Gemma 2 27B IT Q4_K_M (Dense, hd256)
+### Model 4: Gemma 2 27B IT Q4_K_M (Dense, ISWA)
 
-🔴 **BROKEN — head_dim=256 not supported**
+✅ **FIXED** — was PPL 13.7 trillion, now 3.80.
 
-| Cache | PPL | Decode tok/s | NIAH |
-|-------|-----|-------------|------|
-| q8_0 | 7.0590 | 28.44 | 3/3 |
-| turbo3 | 13,689,355,092,855 | 25.36 | 0/3 |
-| turbo4 | 8,620,202,622,890 | 26.12 | 0/3 |
+**Root cause:** The ISWA (interleaved sliding window attention) `build_attn` overload was missing turbo WHT Q rotation and V inverse rotation. K/V were rotated in SET_ROWS but Q was unrotated → `rotated_K × unrotated_Q = garbage`. One fix in `llama-graph.cpp`.
 
-Gemma 2 uses head_dim=256. TurboQuant WHT rotation and centroids are optimized for hd128. Known limitation — tracked in community issues.
+**Note:** Gemma 2 K/V head_dim IS 128 (not 256 as initially assumed — GGUF metadata confirms `key_length=128`).
+
+| Cache | PPL | vs q8_0 | Decode tok/s | NIAH |
+|-------|-----|---------|-------------|------|
+| q8_0 | 3.7504 | — | 28.44 | 3/3 |
+| turbo4 | 3.7852 | +0.9% | 26.12 | — |
+| turbo3 | 3.7957 | +1.2% | 25.36 | — |
+
+This fix also applies to any other ISWA model (Cohere2, OLMo2, Gemma3N).
 
 ### Model 5: Phi-4 Q8_0 (Dense)
 
@@ -75,7 +83,14 @@ Gemma 2 uses head_dim=256. TurboQuant WHT rotation and centroids are optimized f
 turbo4 quality advantage holds on Phi-4. +1.7% vs q8_0.
 
 ### Model 6: Llama 3.1 70B Instruct Q4_K_M (Dense, large)
-PENDING — downloading
+
+| Cache | PPL | vs q8_0 | Decode tok/s | NIAH |
+|-------|-----|---------|-------------|------|
+| q8_0 | 2.4397 | — | 11.50 | 3/3 |
+| turbo4 | 2.6431 | +8.3% | 10.78 | 3/3 |
+| turbo3 | 2.7878 | +14.3% | 10.68 | 3/3 |
+
+Larger PPL gap than smaller models. Likely due to Q4_K_M weight quantization stacking with KV quantization — the model weights are already quantized, adding KV quantization compounds the error. turbo4 still significantly better than turbo3.
 
 ### Model 7: Mistral Small 24B Q4_K_M (Dense)
 
