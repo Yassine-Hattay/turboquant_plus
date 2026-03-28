@@ -265,24 +265,44 @@ turbo4 prefill matches or exceeds q8\_0 at all context lengths. Compressed cache
 - Sparse V: active and compatible
 - Long context: stable (no QJL degradation)
 
-### Head-Dim-Dependent Centroids (Discovery)
+### Centroid Investigation (Resolved)
 
-buun tested our 4-bit centroids on CUDA and found they work better on hd128 but slightly worse on hd256. The reason: our centroids are Lloyd-Max optimal for N(0, 1/√d) at d=128, not standard N(0,1).
+buun tested our 4-bit centroids on CUDA and initially found they worked better on hd128 but slightly worse on hd256. His agent suspected our centroids were non-standard.
 
 ```
 Ours (d=128, σ=0.0884):  outer centroid = 0.1739  (1.97σ)
 buun's (N(0,1) scaled):  outer centroid = 0.2416  (2.73σ)
 ```
 
-The post-WHT distribution is N(0, 1/√d), which depends on head_dim. Optimal centroids should be computed per head_dim:
-- d=128: σ = 1/√128 ≈ 0.0884
-- d=256: σ = 1/√256 = 0.0625
+**Resolution:** Our centroids are standard Lloyd-Max for N(0, 1/√128), which is the correct post-FWHT distribution. buun's empirical validation showed they're within 0.2-0.3% of optimal computed from real KV data. The -0.19% "beats q8_0" result at 2K was a short-context artifact — at 8K it was +0.82%, same as Gaussian centroids.
 
-buun confirmed: our d=128 centroids give **better quality than q8_0 on hd128** (!) but regress slightly on hd256. Head-dim-dependent codebooks may be the fix for the hd128 quality gap the entire community has been chasing.
+### Why turbo4 Fixes the head_dim=128 Gap
+
+The hd128 quality gap is **not** about centroids, FWHT mixing stages, or InnerQ equalization. It's fundamental to bit rate and dimensionality.
+
+Attention logits are `q·k / √d`. Quantization error variance in each logit:
+
+```
+Var(Δlogit) = MSE_per_element / d
+```
+
+At fixed MSE: hd128 has **2x the logit variance** of hd256 (128 vs 256 dimensions to average over). More variance → more softmax ranking errors → worse PPL.
+
+Going from 8→16 centroids (turbo3→turbo4) roughly halves MSE per element. So turbo4 on hd128 ≈ turbo3 on hd256 in terms of logit noise.
+
+buun's CUDA data confirms:
+
+| Config | hd128 vs q8_0 | Explanation |
+|--------|-------------|-------------|
+| turbo3 (8 centroids) | +3.33% | High noise, few centroids, few dims |
+| turbo4 Gaussian centroids | +1.20% | 3x better — just from 16 centroids |
+| turbo4 our centroids (2K) | -0.19% | Short-context artifact |
+| turbo4 our centroids (8K) | +0.82% | Same as Gaussian — centroids are already optimal |
+
+**Conclusion:** The centroids are a solved problem. The hd128 fix is more bits (turbo4), not better centroids, not InnerQ, not CAT alignment. Beautifully simple.
 
 **What's next:**
 - KLD and NIAH characterization
-- Head-dim-dependent centroid codebooks (d=128 and d=256)
 - Asymmetric K/V (turbo3-K + turbo4-V — blocked by cross-type FA kernel instantiation)
 - Upstream integration
 - CUDA port
