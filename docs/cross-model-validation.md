@@ -49,7 +49,8 @@ Already validated extensively. See README and turbo4-resurrection.md.
 | turbo4 | 6.9378 | 17.25 | 1.00x |
 
 ### Model 3: Mixtral 8x7B Instruct Q4_K_M (MoE)
-PENDING — running
+
+⚠️ **GGUF incompatible** — `second-state` repo uses old format, missing `ffn_down_exps` tensor. Need bartowski or official Mixtral GGUF. Skipped.
 
 ### Model 4: Gemma 2 27B IT Q4_K_M (Dense, hd256)
 
