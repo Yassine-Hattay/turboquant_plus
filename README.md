@@ -29,7 +29,7 @@ Validated end-to-end on Qwen 3.5 35B-A3B (MoE) on M5 Max via llama.cpp Metal.
 - **Temporal decay**: 30-34% memory savings at long context (experiment branch)
 - **NIAH retrieval**: 9/9 single needle with sparse V (vs 7/9 baseline), 100% multi-key through 32K
 - **14 decode approaches tested** on M2 Pro — comprehensive hardware analysis
-- Community: 10+ testers across M1/M2/M5 Mac, RTX 3090/4090/5090, AMD 6800 XT/9070
+- Community: 30+ testers across M1/M2/M3/M5 Mac, RTX 3080 Ti/3090/4090/5090, AMD 6800 XT/9070 XT
 - Rotation Gaussianization validated on real Qwen3 KV tensors (kurtosis 900 → 2.9)
 
 ---
@@ -185,6 +185,27 @@ KV cache memory at 262K context:
 
 PPL on real document (70-pages.md, ctx=512, 20 chunks): q8_0 16.29, turbo4 16.44 (+0.93%), turbo3 16.42 (+0.76%), turbo2 17.22 (+5.69%).
 
+### Community Hardware: AMD RX 9070 XT (RDNA 4, gfx1201, Windows 11)
+
+First AMD GPU validation. Qwen2.5-7B Q4_K_M on HIP SDK 7.1. gfx1201 detected natively — no `HSA_OVERRIDE_GFX_VERSION` needed.
+
+| K | V | PPL (wikitext-2) | vs q8_0 | Prefill t/s | Decode t/s | Status |
+|---|---|-----------------|---------|-------------|-----------|--------|
+| q8_0 | q8_0 | 7.794 | baseline | 589.5 | 84.7 | OK |
+| **q8_0** | **turbo4** | **7.876** | **+1.0%** | **588.4** | **86.8** | **recommended** |
+| q8_0 | turbo3 | NaN | catastrophic | 605.1 | 87.8 | broken (HIP-specific) |
+| turbo4 | turbo4 | 401.4 | catastrophic | 556.4 | 84.0 | broken (Q4_K_M) |
+| turbo3 | turbo3 | 81,277 | catastrophic | 580.3 | 86.0 | broken (Q4_K_M) |
+
+**Key findings:**
+- **q8_0-K + turbo4-V confirmed on AMD** — +1.0% PPL, no speed penalty, 25% KV memory savings
+- Symmetric turbo catastrophic on Q4_K_M, consistent with Metal/CUDA results
+- q8_0/turbo3 produces NaN on this model (Metal gets +2.0%) — HIP-specific, under investigation
+- Speed flat across configs (~85 t/s decode, ~590 t/s prefill at pp512)
+- Context scaling: 0.96-0.99x vs q8_0 at pp2048-8192
+
+See [Windows RDNA 4 Setup Guide](docs/windows-rdna4-setup.md) for build instructions and 9 gotchas.
+
 ### Speed Optimization Journey
 
 | Optimization | Prefill tok/s | vs q8_0 |
@@ -312,10 +333,16 @@ git checkout feature/turboquant-kv-cache
 cmake -B build -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
-# Build with CUDA (NVIDIA) — community tested on RTX 3090/4090/5090
-# Use signalnine's CUDA fork: https://github.com/signalnine/llama-cpp-turboquant-cuda
+# Build with CUDA (NVIDIA) — community tested on RTX 3080 Ti/3090/4090/5090
 # cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 # cmake --build build -j
+
+# Build with HIP (AMD) — tested on RX 9070 XT (RDNA 4, gfx1201)
+# See docs/windows-rdna4-setup.md for Windows gotchas
+# cmake -S . -B build -G Ninja -DGPU_TARGETS=gfx1201 -DGGML_HIP=ON \
+#   -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_C_COMPILER=clang \
+#   -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
+# cmake --build build --config Release
 
 # Verify turbo types are available
 ./build/bin/llama-server --help | grep turbo
