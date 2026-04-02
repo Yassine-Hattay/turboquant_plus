@@ -274,28 +274,9 @@ Expected results (Qwen3.5-27B):
 
 **What to report:** paste all 3 llama-bench outputs in [PR #45](https://github.com/TheTom/llama-cpp-turboquant/pull/45) along with your GPU model. Crashes, errors, or unexpected output are equally valuable.
 
-### How to Quantize (detailed)
+### Other Models and Configs
 
-Create a tensor type file for your model, then quantize:
-
-```bash
-# Step 1: Generate Config I tensor type file for your model
-# Adjust n_layers for your model (28 for 1.5B, 64 for 27B, 80 for 70B, etc.)
-python3 -c "
-n_layers = 64  # <-- set this for your model
-boundary = 2
-for i in range(boundary, n_layers - boundary):
-    for t in ['attn_q', 'attn_k', 'attn_v', 'attn_output', 'ffn_gate', 'ffn_up']:
-        print(f'blk.{i}.{t}.weight=tq4_1s')
-    print(f'blk.{i}.ffn_down.weight=q4_k')
-" > config_i.txt
-
-# Step 2: Quantize from Q8_0 source
-./build/bin/llama-quantize \
-  --allow-requantize \
-  --tensor-type-file config_i.txt \
-  model-Q8_0.gguf model-config-i.gguf Q8_0
-```
+The Quick Test above uses Config I, which works for Qwen, Phi, and most non-Llama models. Adjust `n_layers` for your model (28 for 1.5B, 64 for 27B, 80 for 70B, etc.). Source must be Q8_0 GGUF.
 
 For **Llama-family models**, use Hybrid (Q4_K for ALL FFN) or Premium (Q5_K/Q6_K FFN):
 
