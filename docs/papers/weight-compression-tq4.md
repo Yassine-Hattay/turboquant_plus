@@ -370,7 +370,7 @@ Based on testing across 5 models and 3 model families:
 
 2. **Policy developed on 1.5B Qwen.** The ablation experiments were primarily on Qwen2.5-1.5B. The policy transfers well to larger Qwen models (+1.3-1.4%) but not to Llama. A per-model sensitivity profiler may be needed for production deployment across model families.
 
-3. **CUDA decode gap.** Metal achieves 94-102% of Q8_0 decode via cooperative SIMD (NR0=8 amortization). CUDA achieves 39-55% of Q8_0 depending on GPU generation (signalnine's fused kernel, V8/V12). The gap is due to cross-warp communication overhead. Optimization is ongoing.
+3. **CUDA decode gap.** Metal achieves 94-102% of Q8_0 decode via cooperative SIMD (NR0=8 amortization). CUDA achieves 39-71% of Q8_0 depending on GPU generation (38.5% on RTX 5090, 55% on 1080 Ti, 70.6% on dual 4090). signalnine's [systematic optimization effort](https://github.com/signalnine/llama-cpp-turboquant/blob/feature/tq4-weight-cuda/docs/tq4-weight-cuda-optimization-log.md) (19 kernel versions, centroid ablation) proved this is a fundamental architectural limitation, not an optimization gap. The bottleneck is float32 activation bandwidth (4x vs q8_1) and float FMA density (1x vs dp4a's 4x). The non-linear centroid lookup itself is free. Q4_K_M achieves nearly equivalent quality (+0.05 PPL) at 3.6x the CUDA decode speed. TQ4_1S is optimal for Metal; on CUDA it may be better positioned as a storage/distribution format with runtime dequant to q8_0 at model load.
 
 4. **No comparison to GPTQ/AWQ/QuIP#.** We compare against q8_0, Q4_K, and Q4_K_M baselines within llama.cpp. Comparison to dedicated weight quantization frameworks is future work.
 
@@ -493,3 +493,4 @@ The current implementation validates the method end-to-end across 6 models and 3
 - Boundary V layer-aware compression: [layer-aware-v-compression.md](layer-aware-v-compression.md)
 - Sparse V dequantization: [sparse-v-dequant.md](sparse-v-dequant.md)
 - MoE V-compression frontier: [moe-v-compression-frontier.md](moe-v-compression-frontier.md)
+- signalnine's CUDA kernel optimization log (V8-V19, centroid ablation, dp4a analysis): [tq4-weight-cuda-optimization-log.md](https://github.com/signalnine/llama-cpp-turboquant/blob/feature/tq4-weight-cuda/docs/tq4-weight-cuda-optimization-log.md)
