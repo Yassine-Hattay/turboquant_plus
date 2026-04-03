@@ -280,6 +280,13 @@ These findings have been independently confirmed by multiple researchers:
 - NIAH passes at 32K across all 14 configs including catastrophic-PPL symmetric configs. Retrieval and generation quality degrade independently
 - Concludes "Asymmetric q8_0-K / 4bit-V should be the default recommendation" — matches our paper's recommendation exactly
 
+**@nihilistau** — [Vilenkin basis spectral analysis, Phi-2 + turbo3](https://github.com/ggml-org/llama.cpp/discussions/20969#discussioncomment-16442465) (2026-04-03):
+- Independent harmonic analysis of K and V cache vectors in the Vilenkin (p-adic/mixed-radix) basis suggests a spectral explanation for why asymmetric compression works
+- K vectors appear to concentrate energy in a small number of universal spectral indices (6 indices at 100% universality across all positions). V vectors appear to spread energy diffusely across the entire spectrum (max 20% universality, no dominant modes)
+- K and V appear to occupy disjoint spectral bands with zero overlap, suggesting they compress independently without interference
+- If confirmed across architectures, this would provide a mathematical basis for the empirical observation that V compression is free while K precision is critical
+- **Caveat:** tested on Phi-2 only. Needs validation on Qwen, Llama, and Gemma architectures before drawing general conclusions. The spectral structure may be model-dependent
+
 ---
 
 ## 8. Limitations
