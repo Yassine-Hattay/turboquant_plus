@@ -11,6 +11,7 @@ Requires: pip install transformers torch accelerate
 
 import sys
 import time
+import json
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -22,6 +23,165 @@ from turboquant.outlier import OutlierTurboQuant
 
 
 MODEL_NAME = "Qwen/Qwen3-1.7B"  # head_dim=128, same as 27B
+
+
+def compute_head_stats(k_cache: np.ndarray, v_cache: np.ndarray) -> dict:
+    """Compute per-head statistical properties from real KV tensors.
+    
+    For each layer and head, computes:
+    - Excess kurtosis (Fisher=True, Gaussian=0)
+    - Outlier ratio: max(|x|) / median(|x|)
+    - Outlier fraction: % of channels > 10× median
+    
+    Args:
+        k_cache: Key cache, shape (num_layers, num_heads, seq_len, head_dim)
+        v_cache: Value cache, same shape
+    
+    Returns:
+        Dict with 'kurtosis', 'max_ratio', 'outlier_fraction' lists for K and V caches,
+        plus layer/head metadata.
+    """
+    num_layers, num_heads, seq_len, head_dim = k_cache.shape
+    
+    k_stats = {
+        'kurtosis': [],
+        'max_ratio': [],
+        'outlier_fraction': [],
+        'layers': [],
+        'heads': []
+    }
+    v_stats = {
+        'kurtosis': [],
+        'max_ratio': [],
+        'outlier_fraction': [],
+        'layers': [],
+        'heads': []
+    }
+    
+    for layer in range(num_layers):
+        for head in range(num_heads):
+            # Flatten across sequence dimension for this layer/head
+            k_vecs = k_cache[layer, head].reshape(-1)  # (seq_len * head_dim,)
+            v_vecs = v_cache[layer, head].reshape(-1)
+            
+            # Compute stats for K cache
+            k_kurt = _excess_kurtosis(k_vecs)
+            k_max_ratio = _outlier_ratio(k_vecs)
+            k_outlier_frac = _outlier_fraction(k_vecs)
+            
+            k_stats['kurtosis'].append(float(k_kurt))
+            k_stats['max_ratio'].append(float(k_max_ratio))
+            k_stats['outlier_fraction'].append(float(k_outlier_frac))
+            k_stats['layers'].append(int(layer))
+            k_stats['heads'].append(int(head))
+            
+            # Compute stats for V cache
+            v_kurt = _excess_kurtosis(v_vecs)
+            v_max_ratio = _outlier_ratio(v_vecs)
+            v_outlier_frac = _outlier_fraction(v_vecs)
+            
+            v_stats['kurtosis'].append(float(v_kurt))
+            v_stats['max_ratio'].append(float(v_max_ratio))
+            v_stats['outlier_fraction'].append(float(v_outlier_frac))
+            v_stats['layers'].append(int(layer))
+            v_stats['heads'].append(int(head))
+    
+    return {'k_cache': k_stats, 'v_cache': v_stats}
+
+
+def _excess_kurtosis(x: np.ndarray) -> float:
+    """Compute excess kurtosis (Fisher definition, Gaussian=0)."""
+    if len(x) < 4:
+        return 0.0
+    m = np.mean(x)
+    s = np.std(x)
+    if s < 1e-10:
+        return 0.0
+    # Fisher kurtosis: E[(X-μ)^4] / σ^4 - 3
+    kurt = np.mean(((x - m) / s) ** 4) - 3.0
+    return kurt
+
+
+def _outlier_ratio(x: np.ndarray) -> float:
+    """Compute outlier ratio: max(|x|) / median(|x|)."""
+    abs_x = np.abs(x)
+    median_abs = np.median(abs_x)
+    if median_abs < 1e-10:
+        return 0.0
+    return float(np.max(abs_x) / median_abs)
+
+
+def _outlier_fraction(x: np.ndarray, threshold: float = 10.0) -> float:
+    """Compute fraction of channels where |x| > threshold × median(|x|)."""
+    abs_x = np.abs(x)
+    median_abs = np.median(abs_x)
+    if median_abs < 1e-10:
+        return 0.0
+    outlier_mask = abs_x > threshold * median_abs
+    return float(np.sum(outlier_mask) / len(x))
+
+
+def save_and_plot_stats(stats: dict, output_path: str = "per_head_stats.json"):
+    """Save stats to JSON and plot histogram of kurtosis values."""
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend
+    import matplotlib.pyplot as plt
+    
+    # Save to JSON
+    with open(output_path, 'w') as f:
+        json.dump(stats, f, indent=2)
+    print(f"  Saved per-head stats to {output_path}")
+    
+    # Plot kurtosis histograms
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    k_kurt = stats['k_cache']['kurtosis']
+    v_kurt = stats['v_cache']['kurtosis']
+    
+    # K cache kurtosis histogram
+    axes[0].hist(k_kurt, bins=50, edgecolor='black', alpha=0.7)
+    axes[0].axvline(np.median(k_kurt), color='red', linestyle='--', 
+                    label=f'Median: {np.median(k_kurt):.2f}')
+    axes[0].set_xlabel('Excess Kurtosis')
+    axes[0].set_ylabel('Frequency')
+    axes[0].set_title('K Cache Per-Head Excess Kurtosis Distribution')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # V cache kurtosis histogram
+    axes[1].hist(v_kurt, bins=50, edgecolor='black', alpha=0.7)
+    axes[1].axvline(np.median(v_kurt), color='red', linestyle='--',
+                    label=f'Median: {np.median(v_kurt):.2f}')
+    axes[1].set_xlabel('Excess Kurtosis')
+    axes[1].set_ylabel('Frequency')
+    axes[1].set_title('V Cache Per-Head Excess Kurtosis Distribution')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('per_head_kurtosis.png', dpi=150)
+    print("  Saved kurtosis histogram to per_head_kurtosis.png")
+    plt.close()
+    
+    # Check if adaptive rotation is necessary
+    k_max_kurt = max(k_kurt) if k_kurt else 0
+    k_median_kurt = np.median(k_kurt) if k_kurt else 1.0
+    v_max_kurt = max(v_kurt) if v_kurt else 0
+    v_median_kurt = np.median(v_kurt) if v_kurt else 1.0
+    
+    k_ratio = k_max_kurt / max(k_median_kurt, 1e-6)
+    v_ratio = v_max_kurt / max(v_median_kurt, 1e-6)
+    
+    print(f"\n  Adaptive Rotation Analysis:")
+    print(f"    K cache: max_kurt={k_max_kurt:.2f}, median_kurt={k_median_kurt:.2f}, ratio={k_ratio:.2f}")
+    print(f"    V cache: max_kurt={v_max_kurt:.2f}, median_kurt={v_median_kurt:.2f}, ratio={v_ratio:.2f}")
+    
+    if k_ratio > 5.0 or v_ratio > 5.0:
+        print(f"  ✅ Adaptive rotation confirmed necessary (ratio > 5x)")
+        return True
+    else:
+        print(f"  ℹ️  Adaptive rotation may not be critical (ratio <= 5x)")
+        return False
 
 
 def load_model():
@@ -305,6 +465,11 @@ def main():
     print(f"  Extracted in {t_extract:.1f}s")
     print(f"  K shape: {kv['k_cache'].shape}, V shape: {kv['v_cache'].shape}")
 
+    # Step 1b: Compute per-head statistics and save
+    print("\n  Computing per-head statistical properties...")
+    head_stats = compute_head_stats(kv['k_cache'], kv['v_cache'])
+    adaptive_needed = save_and_plot_stats(head_stats)
+
     # Step 2: Analyze real KV distributions
     analyze_kv_distribution(kv)
 
@@ -328,6 +493,8 @@ def main():
 
     print(f"\n  ✅ Phase A validation complete.")
     print(f"  Next: Phase B — port to llama.cpp for real inference testing.")
+
+    return head_stats if adaptive_needed else None
 
 
 if __name__ == "__main__":
