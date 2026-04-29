@@ -11,6 +11,7 @@ import time
 import json
 import argparse
 import random
+import re
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -406,6 +407,131 @@ def compress_and_compare_asymmetric(kv: dict, head_dim: int) -> dict:
     }
 
 
+def compress_layer_adaptive(kv: dict, head_dim: int, protected_layers: list[int],
+                            base_bits: int = 3, protected_bits: int = 4) -> dict:
+    """Compress KV cache with layer-adaptive bit-widths.
+    
+    Compresses specified layers with higher bit-width (protected_bits) while
+    using lower bit-width (base_bits) for other layers.
+    
+    Args:
+        kv: Dict with 'k_cache' and 'v_cache' tensors.
+        head_dim: Dimension of each attention head.
+        protected_layers: List of layer indices to protect with higher bits.
+                         Negative indices are resolved from the end.
+        base_bits: Bit-width for non-protected layers.
+        protected_bits: Bit-width for protected layers.
+    
+    Returns:
+        Dict with k_mse, v_mse, k_cosine, attn_cosine, attn_mse, compression_ratio,
+        following the same structure as compress_and_compare_asymmetric().
+    """
+    result, _, _ = compress_layer_adaptive_with_output(kv, head_dim, protected_layers, 
+                                                        base_bits, protected_bits)
+    return result
+
+
+def compress_layer_adaptive_with_output(kv: dict, head_dim: int, protected_layers: list[int],
+                                        base_bits: int = 3, protected_bits: int = 4) -> tuple[dict, np.ndarray, np.ndarray]:
+    """Compress KV cache with layer-adaptive bit-widths, returning compressed tensors.
+    
+    Same as compress_layer_adaptive but also returns k_hat and v_hat for further analysis.
+    
+    Returns:
+        Tuple of (result_dict, k_hat, v_hat)
+    """
+    k_cache = kv["k_cache"]
+    v_cache = kv["v_cache"]
+    num_layers, num_heads, seq_len, head_dim = k_cache.shape
+    
+    # Resolve negative indices
+    resolved_protected = set()
+    for idx in protected_layers:
+        if idx < 0:
+            resolved_protected.add(num_layers + idx)
+        else:
+            resolved_protected.add(idx)
+    
+    # Create quantizers
+    k_quantizer_base = TurboQuant(head_dim, bit_width=base_bits, seed=42)
+    v_quantizer_base = TurboQuantMSE(head_dim, bit_width=base_bits, seed=43)
+    k_quantizer_protected = TurboQuant(head_dim, bit_width=protected_bits, seed=44)
+    v_quantizer_protected = TurboQuantMSE(head_dim, bit_width=protected_bits, seed=45)
+    
+    k_hat = np.zeros_like(k_cache)
+    v_hat = np.zeros_like(v_cache)
+    
+    for layer in range(num_layers):
+        is_protected = layer in resolved_protected
+        k_quant = k_quantizer_protected if is_protected else k_quantizer_base
+        v_quant = v_quantizer_protected if is_protected else v_quantizer_base
+        
+        for head in range(num_heads):
+            # K cache
+            k_vecs = k_cache[layer, head]
+            k_compressed = k_quant.quantize(k_vecs)
+            k_hat[layer, head] = k_quant.dequantize(k_compressed)
+            
+            # V cache
+            v_vecs = v_cache[layer, head]
+            v_indices, v_norms = v_quant.quantize(v_vecs)
+            v_hat[layer, head] = v_quant.dequantize(v_indices, v_norms)
+    
+    # Compute metrics
+    k_mse = np.mean((k_cache - k_hat) ** 2)
+    v_mse = np.mean((v_cache - v_hat) ** 2)
+    
+    # K cosine similarity (per-vector)
+    k_flat = k_cache.reshape(-1, head_dim)
+    k_hat_flat = k_hat.reshape(-1, head_dim)
+    k_cosines = _batch_cosine_sim(k_flat, k_hat_flat)
+    k_cosine = np.mean(k_cosines)
+    
+    # Attention quality test (sample first layer, first head)
+    rng = np.random.default_rng(42)
+    q = rng.standard_normal((1, head_dim)).astype(np.float32)
+    k_sample = k_cache[0, 0]
+    v_sample = v_cache[0, 0]
+    k_hat_sample = k_hat[0, 0]
+    v_hat_sample = v_hat[0, 0]
+    
+    # Original attention
+    scores = q @ k_sample.T / np.sqrt(head_dim)
+    attn = _softmax(scores)
+    out_orig = attn @ v_sample
+    
+    # Compressed attention
+    scores_c = q @ k_hat_sample.T / np.sqrt(head_dim)
+    attn_c = _softmax(scores_c)
+    out_comp = attn_c @ v_hat_sample
+    
+    attn_cosine = np.dot(out_orig.ravel(), out_comp.ravel()) / (
+        max(np.linalg.norm(out_orig) * np.linalg.norm(out_comp), 1e-10))
+    attn_mse = np.mean((out_orig - out_comp) ** 2)
+    
+    # Compression ratio: weighted average based on layer allocation
+    n_vectors_per_layer = num_heads * seq_len
+    protected_vectors = len(resolved_protected) * n_vectors_per_layer
+    base_vectors = (num_layers - len(resolved_protected)) * n_vectors_per_layer
+    
+    # Bits per vector: K bits + norm overhead + V bits
+    bits_per_vector_protected = head_dim * protected_bits + 32 + head_dim * protected_bits
+    bits_per_vector_base = head_dim * base_bits + 32 + head_dim * base_bits
+    
+    original_bits = num_layers * n_vectors_per_layer * head_dim * 32 * 2  # K + V fp32
+    compressed_bits = protected_vectors * bits_per_vector_protected + base_vectors * bits_per_vector_base
+    compression_ratio = original_bits / compressed_bits
+    
+    return {
+        "k_mse": k_mse,
+        "v_mse": v_mse,
+        "k_cosine": k_cosine,
+        "attn_cosine": attn_cosine,
+        "attn_mse": attn_mse,
+        "compression_ratio": compression_ratio,
+    }, k_hat, v_hat
+
+
 def compress_and_compare(kv: dict):
     """Compress real KV tensors and measure quality at various bit-widths."""
     print("\n" + "=" * 70)
@@ -429,7 +555,8 @@ def compress_and_compare(kv: dict):
     print(f"     Measures how much softmax + V weighting amplifies quantization distortion.")
     print(f"     < 0.85  → Heavy distortion (unsafe for reasoning/retrieval)")
     print(f"     0.85-0.95 → Moderate (usable for casual chat)")
-    print(f"     > 0.95  → Near-baseline (safe for production)\n")
+    print(f"     > 0.95  → Near-baseline (safe for production)")
+    print(f"  ⚠️  Safety threshold uses Layers 1+ (Layer 0 excluded as known outlier)\n")
 
     configs = [
         ("Uniform 2-bit", 2, 2, "uniform"),
@@ -438,6 +565,10 @@ def compress_and_compare(kv: dict):
         ("Outlier 3.5-bit", 3.5, 3.5, "outlier"),
         ("Uniform 4-bit", 4, 4, "uniform"),
         ("Asymmetric 4K/2V", None, None, "asymmetric"),
+        # Layer-adaptive compression experiments
+        ("Adaptive (L0 4b, rest 3b)", None, None, "adaptive_l0"),
+        ("Adaptive (L0+last2 4b)", None, None, "adaptive_l0last2"),
+        ("Adaptive (last4 4b)", None, None, "adaptive_last4"),
     ]
 
     results = {}
@@ -451,6 +582,27 @@ def compress_and_compare(kv: dict):
             ratio = asym_result["compression_ratio"]
             k_hat = None  # Not needed for display
             attn_cosine = asym_result["attn_cosine"]
+        elif mode.startswith("adaptive_"):
+            # Layer-adaptive compression experiments
+            if mode == "adaptive_l0":
+                protected_layers = [0]
+            elif mode == "adaptive_l0last2":
+                # Resolve negative indices: -2, -1 become num_layers-2, num_layers-1
+                protected_layers = [0, num_layers - 2, num_layers - 1]
+            elif mode == "adaptive_last4":
+                # Last 4 layers: num_layers-4, num_layers-3, num_layers-2, num_layers-1
+                protected_layers = [num_layers - 4, num_layers - 3, num_layers - 2, num_layers - 1]
+            
+            adaptive_result, k_hat_adaptive, v_hat_adaptive = compress_layer_adaptive_with_output(
+                kv, head_dim, protected_layers, base_bits=3, protected_bits=4)
+            k_mse = adaptive_result["k_mse"]
+            v_mse = adaptive_result["v_mse"]
+            k_cosine = adaptive_result["k_cosine"]
+            ratio = adaptive_result["compression_ratio"]
+            k_hat = None
+            attn_cosine = adaptive_result["attn_cosine"]
+            # Compute layer metrics for nonlinearity penalty
+            _, layer_metrics = _compute_attn_cosine(k_cache, v_cache, k_hat_adaptive, v_hat_adaptive, head_dim)
         elif mode == "uniform":
             compressor = KVCacheCompressor(head_dim=head_dim, k_bits=int(k_bits), v_bits=int(v_bits))
             compressed = compressor.compress(k_cache, v_cache)
@@ -468,7 +620,7 @@ def compress_and_compare(kv: dict):
             k_cosine = np.mean(cosines)
             
             # Compute attention cosine for nonlinearity penalty
-            attn_cosine = _compute_attn_cosine(k_cache, v_cache, k_hat, v_hat, head_dim)
+            attn_cosine, layer_metrics = _compute_attn_cosine(k_cache, v_cache, k_hat, v_hat, head_dim)
         else:
             # Outlier: compress each head individually
             k_hat, v_hat, ratio = _compress_outlier(k_cache, v_cache, k_bits, v_bits, head_dim)
@@ -483,10 +635,10 @@ def compress_and_compare(kv: dict):
             k_cosine = np.mean(cosines)
             
             # Compute attention cosine for nonlinearity penalty
-            attn_cosine = _compute_attn_cosine(k_cache, v_cache, k_hat, v_hat, head_dim)
+            attn_cosine, layer_metrics = _compute_attn_cosine(k_cache, v_cache, k_hat, v_hat, head_dim)
 
-        # Compute nonlinearity penalty
-        nonlinearity_penalty = attn_cosine / k_cosine if k_cosine > 1e-10 else 0.0
+        # Compute nonlinearity penalty using Layers 1+ (excluding Layer 0 outlier)
+        nonlinearity_penalty = layer_metrics['nonlin_excluding_layer0']
         warning = ""
         if nonlinearity_penalty < 0.85:
             warning = " [⚠️ UNSAFE FOR REASONING]"
@@ -498,19 +650,30 @@ def compress_and_compare(kv: dict):
             "cosine": k_cosine, 
             "ratio": ratio,
             "nonlinearity_penalty": nonlinearity_penalty,
+            "layer_metrics": layer_metrics,
         }
 
     return results
 
 
-def _compute_attn_cosine(k_cache, v_cache, k_hat, v_hat, head_dim: int) -> float:
-    """Compute average attention cosine similarity between original and compressed."""
+def _compute_attn_cosine(k_cache, v_cache, k_hat, v_hat, head_dim: int) -> tuple[float, dict]:
+    """Compute average attention cosine similarity between original and compressed.
+    
+    Returns:
+        Tuple of (overall_cosine, layer_metrics_dict) where layer_metrics_dict contains:
+        - 'nonlin_excluding_layer0': Average nonlinearity ratio for Layers 1+
+        - 'nonlin_layer0': Nonlinearity ratio for Layer 0 (separate)
+    """
     rng = np.random.default_rng(42)
     num_layers, num_heads, seq_len, _ = k_cache.shape
     
     cosines = []
-    # Sample a few layers/heads for efficiency
-    for layer in range(min(num_layers, 2)):
+    layer_nonlin_ratios = {}
+    
+    # Sample all layers (or first 4 if many layers) for comprehensive analysis
+    max_layers_to_sample = min(num_layers, 4) if num_layers > 4 else num_layers
+    
+    for layer in range(max_layers_to_sample):
         for head in range(min(num_heads, 4)):
             q = rng.standard_normal((1, head_dim)).astype(np.float32)
             k = k_cache[layer, head]
@@ -531,8 +694,30 @@ def _compute_attn_cosine(k_cache, v_cache, k_hat, v_hat, head_dim: int) -> float
             cos = np.dot(out_orig.ravel(), out_comp.ravel()) / (
                 max(np.linalg.norm(out_orig) * np.linalg.norm(out_comp), 1e-10))
             cosines.append(cos)
+        
+        # Compute nonlinearity ratio for this layer
+        k_flat = k_cache[layer].reshape(-1, head_dim)
+        k_hat_flat = k_hat[layer].reshape(-1, head_dim)
+        k_cosines = _batch_cosine_sim(k_flat, k_hat_flat)
+        k_cos = np.mean(k_cosines)
+        
+        # Get layer attention cosine (average across heads sampled above)
+        layer_start_idx = layer * min(num_heads, 4)
+        layer_end_idx = (layer + 1) * min(num_heads, 4)
+        layer_attn_cos = np.mean(cosines[layer_start_idx:layer_end_idx])
+        
+        nonlin_ratio = layer_attn_cos / k_cos if k_cos > 1e-10 else 0.0
+        layer_nonlin_ratios[layer] = nonlin_ratio
     
-    return np.mean(cosines) if cosines else 1.0
+    # Compute nonlinearity excluding Layer 0 (for safety threshold)
+    nonlin_excluding_layer0 = np.mean([v for k, v in layer_nonlin_ratios.items() if k > 0]) if len(layer_nonlin_ratios) > 1 else 1.0
+    nonlin_layer0 = layer_nonlin_ratios.get(0, 1.0)
+    
+    return np.mean(cosines) if cosines else 1.0, {
+        'nonlin_excluding_layer0': nonlin_excluding_layer0,
+        'nonlin_layer0': nonlin_layer0,
+        'layer_nonlin_ratios': layer_nonlin_ratios
+    }
 
 
 def _compress_outlier(k_cache, v_cache, k_bits, v_bits, head_dim):
@@ -703,9 +888,13 @@ def niah_test_standardized(model, tokenizer, target_tokens: int = 4096,
         
         with torch.no_grad():
             outputs = model.generate(
-                **inputs, max_new_tokens=10, do_sample=False, temperature=0.0, top_p=1.0
+                **inputs, max_new_tokens=50, do_sample=False, temperature=0.0, top_p=1.0
             )
         response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+        
+        # Strip <think> blocks for Qwen3 thinking models before scoring
+        if "</think>" in response:
+            response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
         
         passed = "TURBOQUANT42" in response.upper().replace(" ", "").replace(".", "")
         results[depth] = {"passed": passed, "response": response[:40]}
