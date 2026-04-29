@@ -1,10 +1,7 @@
 """Phase A: Validate TurboQuant with real KV cache tensors from Qwen3-1.7B.
 
-Loads a small Qwen model, runs inference, captures real K/V tensors,
-compresses them with TurboQuant, and measures quality degradation.
-
 Usage:
-    python3 benchmarks/validate_real_model.py
+    python3 benchmarks/validate_real_model.py --model Qwen/Qwen3-1.7B --target-tokens 1024
 
 Requires: pip install transformers torch accelerate
 """
@@ -12,6 +9,8 @@ Requires: pip install transformers torch accelerate
 import sys
 import time
 import json
+import argparse
+import random
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -23,6 +22,28 @@ from turboquant.outlier import OutlierTurboQuant
 
 
 MODEL_NAME = "Qwen/Qwen3-1.7B"  # head_dim=128, same as 27B
+
+
+def generate_long_prompt(tokenizer, target_tokens: int, seed: int = 42) -> str:
+    """Generate a synthetic prompt of exactly ~target_tokens length.
+    Uses diverse, non-repetitive filler to avoid attention pattern degradation."""
+    rng = random.Random(seed)
+    fillers = [
+        "The development of artificial intelligence has fundamentally transformed computational paradigms across multiple domains. " * 3,
+        "Quantum mechanics describes nature at the smallest scales, where particles exhibit wave-particle duality and entanglement. " * 3,
+        "Historical archives from the 19th century reveal unprecedented insights into industrialization patterns and economic shifts. " * 3,
+        "Mathematical topology studies properties preserved under continuous deformations of geometric objects and manifolds. " * 3,
+        "Cognitive neuroscience explores the biological substrates of consciousness, memory formation, and decision-making processes. " * 3,
+        "Climate modeling requires high-resolution simulations of atmospheric dynamics, ocean currents, and cryosphere interactions. " * 3,
+    ]
+    prompt = ""
+    while len(tokenizer.encode(prompt, add_special_tokens=False)) < target_tokens:
+        prompt += rng.choice(fillers)
+    
+    # Exact trim to target token count
+    tokens = tokenizer.encode(prompt, add_special_tokens=False)
+    prompt = tokenizer.decode(tokens[:target_tokens], skip_special_tokens=True)
+    return prompt
 
 
 def compute_head_stats(k_cache: np.ndarray, v_cache: np.ndarray) -> dict:
@@ -401,7 +422,14 @@ def compress_and_compare(kv: dict):
           f"({(k_cache.nbytes + v_cache.nbytes) / 1024 / 1024:.1f} MB)")
 
     print(f"\n  {'Config':<22} {'K MSE':>12} {'V MSE':>12} {'K Cosine':>10} {'Ratio':>8} {'Nonlin':>8}")
-    print(f"  {'─' * 76}")
+    print(f"  {'─' * 85}")
+    print(f"  📐 Metric Legend:")
+    print(f"     Ratio     = Original FP32 Size / Compressed Size")
+    print(f"     Nonlin    = AttentionOutputCos / K_VectorCos")
+    print(f"     Measures how much softmax + V weighting amplifies quantization distortion.")
+    print(f"     < 0.85  → Heavy distortion (unsafe for reasoning/retrieval)")
+    print(f"     0.85-0.95 → Moderate (usable for casual chat)")
+    print(f"     > 0.95  → Near-baseline (safe for production)\n")
 
     configs = [
         ("Uniform 2-bit", 2, 2, "uniform"),
@@ -642,36 +670,54 @@ def attention_quality_test(model, tokenizer, kv: dict):
         print(f"  {bits_label:<20} {avg_attn_cos:>16.6f} {max_attn_err:>16.6f}")
 
 
-def niah_test(model, tokenizer):
-    """Simple Needle-in-a-Haystack test."""
+def niah_test_standardized(model, tokenizer, target_tokens: int = 4096, 
+                           depths: list[float] = [0.0, 0.25, 0.5, 0.75, 1.0]):
+    """Standardized Needle-In-A-Haystack test following industry methodology."""
     print("\n" + "=" * 70)
-    print("NEEDLE-IN-A-HAYSTACK TEST")
+    print("NEEDLE-IN-A-HAYSTACK TEST (Standardized)")
     print("=" * 70)
 
-    needle = "The secret code is TURBOQUANT42."
-    haystack = "This is some filler text about various topics. " * 50
-    prompt = f"{haystack}\n\n{needle}\n\n{haystack}\n\nWhat is the secret code?"
-
-    inputs = tokenizer(prompt, return_tensors="pt")
-    seq_len = inputs["input_ids"].shape[1]
-    print(f"\n  Prompt length: {seq_len} tokens")
-    print(f"  Needle: '{needle}'")
-
-    with torch.no_grad():
-        # Generate with full precision KV cache
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=30,
-            do_sample=False,
-            temperature=1.0,
-        )
-
-    response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-    found = "TURBOQUANT42" in response
-    print(f"  Response: {response[:100]}...")
-    print(f"  Needle found: {'✅ YES' if found else '❌ NO'}")
-
-    return found
+    needle = "The secret verification code is TURBOQUANT42."
+    query = "What is the secret verification code mentioned in the text above? Reply with ONLY the code."
+    
+    prompt_base = generate_long_prompt(tokenizer, int(target_tokens * 0.95), seed=42)
+    base_tokens = tokenizer.encode(prompt_base, add_special_tokens=False)
+    
+    results = {}
+    for depth in depths:
+        insert_idx = max(0, int(len(base_tokens) * depth))
+        needle_tokens = tokenizer.encode(f"\n{needle}\n", add_special_tokens=False)
+        combined = base_tokens[:insert_idx] + needle_tokens + base_tokens[insert_idx:]
+        context_text = tokenizer.decode(combined[:target_tokens], skip_special_tokens=True)
+        
+        try:
+            formatted = tokenizer.apply_chat_template(
+                [{"role": "user", "content": context_text + f"\n\n{query}"}],
+                tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            formatted = f"User: {context_text}\n{query}\nAssistant:"
+        
+        inputs = tokenizer(formatted, return_tensors="pt")
+        input_len = inputs["input_ids"].shape[1]
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs, max_new_tokens=10, do_sample=False, temperature=0.0, top_p=1.0
+            )
+        response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+        
+        passed = "TURBOQUANT42" in response.upper().replace(" ", "").replace(".", "")
+        results[depth] = {"passed": passed, "response": response[:40]}
+        
+        status = "✅ PASS" if passed else "❌ FAIL"
+        print(f"  Depth {depth:>4.0%} | {status} | Response: {response[:40]}...")
+        
+    overall = sum(1 for r in results.values() if r["passed"])
+    print(f"\n  📊 Baseline NIAH Score: {overall}/{len(depths)} at {target_tokens} tokens")
+    if overall < len(depths):
+        print(f"  ⚠️  Model baseline failed NIAH. Quantization results will be misleading at this context.")
+    return results
 
 
 def _softmax(x):
@@ -699,52 +745,57 @@ def _batch_cosine_sim(A, B):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="TurboQuant Phase A Validation")
+    parser.add_argument("--model", default="Qwen/Qwen3-1.7B", help="Model ID or path")
+    parser.add_argument("--target-tokens", type=int, default=512, help="Context length for KV extraction & NIAH")
+    parser.add_argument("--niah-depths", default="0.0,0.25,0.5,0.75,1.0", help="Comma-separated needle depths")
+    parser.add_argument("--skip-niah", action="store_true", help="Skip NIAH test")
+    args = parser.parse_args()
+
+    global MODEL_NAME
+    MODEL_NAME = args.model
+    
+    if "1.7B" in args.model or "0.5B" in args.model:
+        print("\n⚠️  WARNING: Model <3B parameters detected. Results may not generalize to 7B+.")
+        print("   For production validation, use --model Qwen/Qwen2.5-7B or larger.\n")
+
     print("=" * 70)
     print("TURBOQUANT PHASE A: REAL MODEL VALIDATION")
-    print(f"Model: {MODEL_NAME} (head_dim=128, same as Qwen 27B)")
+    print(f"Model: {MODEL_NAME}")
+    print(f"Target Context: {args.target_tokens} tokens")
     print("=" * 70)
 
     model, tokenizer = load_model()
 
-    # Step 1: Extract real KV tensors using generation to ensure full prompt processing
-    prompt = ("Explain the concept of vector quantization in the context of "
-              "large language model inference optimization, including KV cache "
-              "compression techniques and their impact on memory usage and "
-              "generation speed for long-context applications.")
-    print(f"\n  Extracting KV cache for prompt ({len(prompt)} chars)...")
+    prompt = generate_long_prompt(tokenizer, args.target_tokens)
+    actual_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
+    print(f"\n  Extracting KV cache for prompt ({actual_tokens} tokens)...")
     t0 = time.perf_counter()
-    # Use extract_kv_cache_after_generation to force full prompt through KV cache
     kv = extract_kv_cache_after_generation(model, tokenizer, prompt, max_new_tokens=1)
     t_extract = time.perf_counter() - t0
     print(f"  Extracted in {t_extract:.1f}s")
     print(f"  K shape: {kv['k_cache'].shape}, V shape: {kv['v_cache'].shape}")
     print(f"  Sequence length: {kv['k_cache'].shape[2]} tokens")
 
-    # Step 1b: Compute per-head statistics and save
     print("\n  Computing per-head statistical properties...")
     head_stats = compute_head_stats(kv['k_cache'], kv['v_cache'])
     adaptive_needed = save_and_plot_stats(head_stats)
-
-    # Step 2: Analyze real KV distributions
     analyze_kv_distribution(kv)
 
-    # Step 3: Compress and compare
     results = compress_and_compare(kv)
-
-    # Step 4: Attention quality
     attention_quality_test(model, tokenizer, kv)
 
-    # Step 5: NIAH
-    niah_test(model, tokenizer)
+    if not args.skip_niah:
+        depths = [float(d) for d in args.niah_depths.split(",")]
+        niah_test_standardized(model, tokenizer, target_tokens=args.target_tokens, depths=depths)
 
-    # Summary
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"\n  Model: {MODEL_NAME}")
-    print(f"  KV shape: {kv['k_cache'].shape}")
+    print(f"\n  Model: {MODEL_NAME} | Context: {actual_tokens} tokens")
     for name, r in results.items():
-        print(f"  {name}: ratio={r['ratio']:.1f}×, K cosine={r['cosine']:.4f}, K MSE={r['k_mse']:.8f}")
+        penalty_note = " [⚠️ UNSAFE]" if r.get("nonlinearity_penalty", 1.0) < 0.85 else ""
+        print(f"  {name:<22} ratio={r['ratio']:.1f}×, K cosine={r['cosine']:.4f}, K MSE={r['k_mse']:.8f}{penalty_note}")
 
     print(f"\n  ✅ Phase A validation complete.")
     print(f"  Next: Phase B — port to llama.cpp for real inference testing.")
