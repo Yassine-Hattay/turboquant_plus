@@ -226,6 +226,55 @@ def extract_kv_cache(model, tokenizer, prompt: str) -> dict:
     return {"k_cache": k_cache, "v_cache": v_cache}
 
 
+def extract_kv_cache_after_generation(model, tokenizer, prompt: str, max_new_tokens: int = 1) -> dict:
+    """Extract KV cache after full prompt processing via generation.
+    
+    This function forces the full prompt through the KV cache by running
+    model.generate() with max_new_tokens=1, ensuring all prompt tokens are
+    processed and cached. This fixes the issue where extract_kv_cache() only
+    captured ~37 tokens because it extracted during a short forward pass.
+    
+    Args:
+        model: The language model to run inference on.
+        tokenizer: Tokenizer for encoding/decoding prompts.
+        prompt: Input prompt string.
+        max_new_tokens: Number of new tokens to generate (default=1 to minimize overhead).
+    
+    Returns:
+        Dict with 'k_cache' and 'v_cache', each shape (num_layers, num_kv_heads, seq_len, head_dim)
+        where seq_len includes both prompt tokens and generated tokens.
+    """
+    inputs = tokenizer(prompt, return_tensors="pt")
+    input_len = inputs["input_ids"].shape[1]
+    
+    with torch.no_grad():
+        # Use generate to force full prompt processing through KV cache
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            use_cache=True,
+            return_dict_in_generate=True,
+            output_scores=False,
+        )
+    
+    # Extract past_key_values from the generation output
+    past_kv = outputs.past_key_values
+    
+    # Handle DynamicCache (iterable of tuples) — K is [0], V is [1]
+    k_tensors = []
+    v_tensors = []
+    
+    for layer_kv in past_kv:
+        layer_tuple = tuple(layer_kv)
+        k_tensors.append(layer_tuple[0].squeeze(0).numpy())
+        v_tensors.append(layer_tuple[1].squeeze(0).numpy())
+    
+    k_cache = np.stack(k_tensors)  # (num_layers, num_kv_heads, seq_len, head_dim)
+    v_cache = np.stack(v_tensors)
+    
+    return {"k_cache": k_cache, "v_cache": v_cache}
+
+
 def analyze_kv_distribution(kv: dict):
     """Analyze the distribution of real KV tensors vs our Gaussian assumption."""
     print("\n" + "=" * 70)
@@ -248,6 +297,94 @@ def analyze_kv_distribution(kv: dict):
     return kv
 
 
+def compress_and_compare_asymmetric(kv: dict, head_dim: int) -> dict:
+    """Compress KV cache with asymmetric K/V bit-widths.
+    
+    Uses TurboQuant (inner product preservation) at 4-bit for K cache
+    and TurboQuantMSE (MSE-only, aggressive compression) at 2-bit for V cache.
+    
+    Args:
+        kv: Dict with 'k_cache' and 'v_cache' tensors.
+        head_dim: Dimension of each attention head.
+    
+    Returns:
+        Dict with k_mse, v_mse, k_cosine, attn_cosine, attn_mse, compression_ratio.
+    """
+    k_cache = kv["k_cache"]
+    v_cache = kv["v_cache"]
+    num_layers, num_heads, seq_len, head_dim = k_cache.shape
+    
+    # Compress K with TurboQuant 4-bit (inner product preservation)
+    k_quantizer = TurboQuant(head_dim, bit_width=4, seed=42)
+    # Compress V with TurboQuantMSE 2-bit (MSE-only, aggressive)
+    v_quantizer = TurboQuantMSE(head_dim, bit_width=2, seed=43)
+    
+    k_hat = np.zeros_like(k_cache)
+    v_hat = np.zeros_like(v_cache)
+    
+    for layer in range(num_layers):
+        for head in range(num_heads):
+            # K cache: batch quantize all seq positions
+            k_vecs = k_cache[layer, head]  # (seq_len, head_dim)
+            k_compressed = k_quantizer.quantize(k_vecs)
+            k_hat[layer, head] = k_quantizer.dequantize(k_compressed)
+            
+            # V cache: MSE-only quantize
+            v_vecs = v_cache[layer, head]
+            v_indices, v_norms = v_quantizer.quantize(v_vecs)
+            v_hat[layer, head] = v_quantizer.dequantize(v_indices, v_norms)
+    
+    # Compute metrics
+    k_mse = np.mean((k_cache - k_hat) ** 2)
+    v_mse = np.mean((v_cache - v_hat) ** 2)
+    
+    # K cosine similarity (per-vector)
+    k_flat = k_cache.reshape(-1, head_dim)
+    k_hat_flat = k_hat.reshape(-1, head_dim)
+    k_cosines = _batch_cosine_sim(k_flat, k_hat_flat)
+    k_cosine = np.mean(k_cosines)
+    
+    # Attention quality test (sample first layer, first head)
+    rng = np.random.default_rng(42)
+    q = rng.standard_normal((1, head_dim)).astype(np.float32)
+    k_sample = k_cache[0, 0]
+    v_sample = v_cache[0, 0]
+    k_hat_sample = k_hat[0, 0]
+    v_hat_sample = v_hat[0, 0]
+    
+    # Original attention
+    scores = q @ k_sample.T / np.sqrt(head_dim)
+    attn = _softmax(scores)
+    out_orig = attn @ v_sample
+    
+    # Compressed attention
+    scores_c = q @ k_hat_sample.T / np.sqrt(head_dim)
+    attn_c = _softmax(scores_c)
+    out_comp = attn_c @ v_hat_sample
+    
+    attn_cosine = np.dot(out_orig.ravel(), out_comp.ravel()) / (
+        max(np.linalg.norm(out_orig) * np.linalg.norm(out_comp), 1e-10))
+    attn_mse = np.mean((out_orig - out_comp) ** 2)
+    
+    # Compression ratio: K=4-bit + norm, V=2-bit (no extra norm for MSE-only)
+    # Original: 32 bits per value (fp32)
+    # Compressed K: 4 bits + 32/head_dim for norm per vector
+    # Compressed V: 2 bits per vector
+    n_vectors = num_layers * num_heads * seq_len
+    original_bits = n_vectors * head_dim * 32 * 2  # K + V
+    compressed_bits = n_vectors * (head_dim * 4 + 32) + n_vectors * head_dim * 2  # K + norm + V
+    compression_ratio = original_bits / compressed_bits
+    
+    return {
+        "k_mse": k_mse,
+        "v_mse": v_mse,
+        "k_cosine": k_cosine,
+        "attn_cosine": attn_cosine,
+        "attn_mse": attn_mse,
+        "compression_ratio": compression_ratio,
+    }
+
+
 def compress_and_compare(kv: dict):
     """Compress real KV tensors and measure quality at various bit-widths."""
     print("\n" + "=" * 70)
@@ -263,8 +400,8 @@ def compress_and_compare(kv: dict):
     print(f"  Original size: {k_cache.nbytes + v_cache.nbytes:,} bytes "
           f"({(k_cache.nbytes + v_cache.nbytes) / 1024 / 1024:.1f} MB)")
 
-    print(f"\n  {'Config':<22} {'K MSE':>12} {'V MSE':>12} {'K Cosine':>10} {'Ratio':>8}")
-    print(f"  {'─' * 66}")
+    print(f"\n  {'Config':<22} {'K MSE':>12} {'V MSE':>12} {'K Cosine':>10} {'Ratio':>8} {'Nonlin':>8}")
+    print(f"  {'─' * 76}")
 
     configs = [
         ("Uniform 2-bit", 2, 2, "uniform"),
@@ -272,32 +409,102 @@ def compress_and_compare(kv: dict):
         ("Uniform 3-bit", 3, 3, "uniform"),
         ("Outlier 3.5-bit", 3.5, 3.5, "outlier"),
         ("Uniform 4-bit", 4, 4, "uniform"),
+        ("Asymmetric 4K/2V", None, None, "asymmetric"),
     ]
 
     results = {}
     for name, k_bits, v_bits, mode in configs:
-        if mode == "uniform":
+        if mode == "asymmetric":
+            # Use the new asymmetric compression function
+            asym_result = compress_and_compare_asymmetric(kv, head_dim)
+            k_mse = asym_result["k_mse"]
+            v_mse = asym_result["v_mse"]
+            k_cosine = asym_result["k_cosine"]
+            ratio = asym_result["compression_ratio"]
+            k_hat = None  # Not needed for display
+            attn_cosine = asym_result["attn_cosine"]
+        elif mode == "uniform":
             compressor = KVCacheCompressor(head_dim=head_dim, k_bits=int(k_bits), v_bits=int(v_bits))
             compressed = compressor.compress(k_cache, v_cache)
             k_hat, v_hat = compressor.decompress(compressed)
             stats = compressor.memory_stats(seq_len, num_layers, num_heads)
             ratio = stats["compression_ratio"]
+            
+            k_mse = np.mean((k_cache - k_hat) ** 2)
+            v_mse = np.mean((v_cache - v_hat) ** 2)
+            
+            # Per-vector cosine similarity
+            k_flat = k_cache.reshape(-1, head_dim)
+            k_hat_flat = k_hat.reshape(-1, head_dim)
+            cosines = _batch_cosine_sim(k_flat, k_hat_flat)
+            k_cosine = np.mean(cosines)
+            
+            # Compute attention cosine for nonlinearity penalty
+            attn_cosine = _compute_attn_cosine(k_cache, v_cache, k_hat, v_hat, head_dim)
         else:
             # Outlier: compress each head individually
             k_hat, v_hat, ratio = _compress_outlier(k_cache, v_cache, k_bits, v_bits, head_dim)
+            
+            k_mse = np.mean((k_cache - k_hat) ** 2)
+            v_mse = np.mean((v_cache - v_hat) ** 2)
+            
+            # Per-vector cosine similarity
+            k_flat = k_cache.reshape(-1, head_dim)
+            k_hat_flat = k_hat.reshape(-1, head_dim)
+            cosines = _batch_cosine_sim(k_flat, k_hat_flat)
+            k_cosine = np.mean(cosines)
+            
+            # Compute attention cosine for nonlinearity penalty
+            attn_cosine = _compute_attn_cosine(k_cache, v_cache, k_hat, v_hat, head_dim)
 
-        k_mse = np.mean((k_cache - k_hat) ** 2)
-        v_mse = np.mean((v_cache - v_hat) ** 2)
-
-        # Per-vector cosine similarity
-        k_flat = k_cache.reshape(-1, head_dim)
-        k_hat_flat = k_hat.reshape(-1, head_dim)
-        cosines = _batch_cosine_sim(k_flat, k_hat_flat)
-
-        print(f"  {name:<22} {k_mse:>12.8f} {v_mse:>12.8f} {np.mean(cosines):>10.6f} {ratio:>7.1f}×")
-        results[name] = {"k_mse": k_mse, "v_mse": v_mse, "cosine": np.mean(cosines), "ratio": ratio}
+        # Compute nonlinearity penalty
+        nonlinearity_penalty = attn_cosine / k_cosine if k_cosine > 1e-10 else 0.0
+        warning = ""
+        if nonlinearity_penalty < 0.85:
+            warning = " [⚠️ UNSAFE FOR REASONING]"
+        
+        print(f"  {name:<22} {k_mse:>12.8f} {v_mse:>12.8f} {k_cosine:>10.6f} {ratio:>7.1f}× {nonlinearity_penalty:>7.3f}{warning}")
+        results[name] = {
+            "k_mse": k_mse, 
+            "v_mse": v_mse, 
+            "cosine": k_cosine, 
+            "ratio": ratio,
+            "nonlinearity_penalty": nonlinearity_penalty,
+        }
 
     return results
+
+
+def _compute_attn_cosine(k_cache, v_cache, k_hat, v_hat, head_dim: int) -> float:
+    """Compute average attention cosine similarity between original and compressed."""
+    rng = np.random.default_rng(42)
+    num_layers, num_heads, seq_len, _ = k_cache.shape
+    
+    cosines = []
+    # Sample a few layers/heads for efficiency
+    for layer in range(min(num_layers, 2)):
+        for head in range(min(num_heads, 4)):
+            q = rng.standard_normal((1, head_dim)).astype(np.float32)
+            k = k_cache[layer, head]
+            v = v_cache[layer, head]
+            k_c = k_hat[layer, head]
+            v_c = v_hat[layer, head]
+            
+            # Original attention
+            scores = q @ k.T / np.sqrt(head_dim)
+            attn = _softmax(scores)
+            out_orig = attn @ v
+            
+            # Compressed attention
+            scores_c = q @ k_c.T / np.sqrt(head_dim)
+            attn_c = _softmax(scores_c)
+            out_comp = attn_c @ v_c
+            
+            cos = np.dot(out_orig.ravel(), out_comp.ravel()) / (
+                max(np.linalg.norm(out_orig) * np.linalg.norm(out_comp), 1e-10))
+            cosines.append(cos)
+    
+    return np.mean(cosines) if cosines else 1.0
 
 
 def _compress_outlier(k_cache, v_cache, k_bits, v_bits, head_dim):
@@ -329,7 +536,10 @@ def _compress_outlier(k_cache, v_cache, k_bits, v_bits, head_dim):
 
 
 def attention_quality_test(model, tokenizer, kv: dict):
-    """Test attention computation quality with compressed KV cache."""
+    """Test attention computation quality with compressed KV cache.
+    
+    Enhanced to track per-layer cosines and compute nonlinearity penalty.
+    """
     print("\n" + "=" * 70)
     print("ATTENTION QUALITY TEST")
     print("=" * 70)
@@ -352,8 +562,12 @@ def attention_quality_test(model, tokenizer, kv: dict):
         ("4-bit uniform", 4, 4, "uniform"),
     ]:
         attn_cosines = []
+        per_layer_cosines = []
+        per_layer_nonlin_ratios = []
 
         for layer in range(min(num_layers, 4)):  # test first 4 layers
+            layer_attn_cosines = []
+            
             for head in range(num_heads):
                 q = rng.standard_normal((1, head_dim)).astype(np.float32)
                 k = k_cache[layer, head]
@@ -385,8 +599,47 @@ def attention_quality_test(model, tokenizer, kv: dict):
                 cos = np.dot(out_orig.ravel(), out_comp.ravel()) / (
                     max(np.linalg.norm(out_orig) * np.linalg.norm(out_comp), 1e-10))
                 attn_cosines.append(cos)
+                layer_attn_cosines.append(cos)
+            
+            # Compute per-layer metrics
+            layer_attn_cos = np.mean(layer_attn_cosines)
+            per_layer_cosines.append(layer_attn_cos)
+            
+            # Compute k_cosine for this layer (for nonlinearity ratio)
+            k_flat = k_cache[layer].reshape(-1, head_dim)
+            if mode == "uniform":
+                compressor = KVCacheCompressor(head_dim=head_dim, k_bits=k_bits, v_bits=v_bits)
+                k_4d = k_cache[layer][np.newaxis, :, :]
+                v_4d = v_cache[layer][np.newaxis, :, :]
+                compressed = compressor.compress(k_4d, v_4d)
+                k_hat, _ = compressor.decompress(compressed)
+                k_hat_flat = k_hat[0].reshape(-1, head_dim)
+            else:
+                k_oq = OutlierTurboQuant(head_dim, target_bits=k_bits, seed=42)
+                k_hat_flat = []
+                for h in range(num_heads):
+                    for i in range(seq_len):
+                        k_hat_flat.append(k_oq.dequantize(k_oq.quantize(k_cache[layer, h, i])))
+                k_hat_flat = np.array(k_hat_flat).reshape(-1, head_dim)
+            
+            k_cosines = _batch_cosine_sim(k_flat, k_hat_flat)
+            k_cos = np.mean(k_cosines)
+            
+            # Nonlinearity ratio
+            nonlin_ratio = layer_attn_cos / k_cos if k_cos > 1e-10 else 0.0
+            per_layer_nonlin_ratios.append(nonlin_ratio)
+            
+            print(f"  Layer {layer}: attn_cosine={layer_attn_cos:.4f} | k_cosine={k_cos:.4f} | nonlin_ratio={nonlin_ratio:.3f}")
 
-        print(f"  {bits_label:<20} {np.mean(attn_cosines):>16.6f} {1 - min(attn_cosines):>16.6f}")
+        avg_attn_cos = np.mean(attn_cosines)
+        max_attn_err = 1 - min(attn_cosines)
+        
+        # Print summary line for this config
+        if len(per_layer_cosines) >= 2:
+            sensitivity_gradient = per_layer_cosines[-1] / per_layer_cosines[0] if per_layer_cosines[0] > 1e-10 else 0.0
+            print(f"  Layer sensitivity gradient: {sensitivity_gradient:.3f}x")
+        
+        print(f"  {bits_label:<20} {avg_attn_cos:>16.6f} {max_attn_err:>16.6f}")
 
 
 def niah_test(model, tokenizer):
@@ -453,17 +706,19 @@ def main():
 
     model, tokenizer = load_model()
 
-    # Step 1: Extract real KV tensors
+    # Step 1: Extract real KV tensors using generation to ensure full prompt processing
     prompt = ("Explain the concept of vector quantization in the context of "
               "large language model inference optimization, including KV cache "
               "compression techniques and their impact on memory usage and "
               "generation speed for long-context applications.")
     print(f"\n  Extracting KV cache for prompt ({len(prompt)} chars)...")
     t0 = time.perf_counter()
-    kv = extract_kv_cache(model, tokenizer, prompt)
+    # Use extract_kv_cache_after_generation to force full prompt through KV cache
+    kv = extract_kv_cache_after_generation(model, tokenizer, prompt, max_new_tokens=1)
     t_extract = time.perf_counter() - t0
     print(f"  Extracted in {t_extract:.1f}s")
     print(f"  K shape: {kv['k_cache'].shape}, V shape: {kv['v_cache'].shape}")
+    print(f"  Sequence length: {kv['k_cache'].shape[2]} tokens")
 
     # Step 1b: Compute per-head statistics and save
     print("\n  Computing per-head statistical properties...")
