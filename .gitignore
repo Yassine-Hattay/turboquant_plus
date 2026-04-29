@@ -1,29 +1,45 @@
-
+```gitignore
+# Python
 __pycache__/
-print.ipynb
 *.pyc
-*.egg-info/
-.venv/
-.pytest_cache/
-dist/
-build/
-*.egg
-notes/
-CLAUDE.md
-.claude/
-.coverage
-htmlcov/
-coverage.xml
-.mypy_cache/
-.DS_Store
+*.pyo
+*.pyd
+
+# Compiled and build artifacts
+*.o
+*.obj
+*.out
 *.so
-*.dylib
-.ipynb_checkpoints/
-niah_reference_v1/
-niah_results*/
-scripts/.turbo-diag-venv/
-niah_decay_test/
-niah_v2_results/
-wikitext-103-raw/
-benchmark-results-raw/*.kld
-*.draft.md
+*.dll
+*.exe
+
+# Dependencies
+.venv/
+venv/
+env/
+node_modules/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Environment variables
+.env
+.env.local
+*.env.*
+
+# Coverage reports
+coverage/
+htmlcov/
+.coverage
+
+# Editors
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+```
