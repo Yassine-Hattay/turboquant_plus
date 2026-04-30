@@ -597,6 +597,7 @@ def compress_and_compare(kv: dict):
             k_cosine = adaptive_rot_result["k_cosine"]
             ratio = adaptive_rot_result["compression_ratio"]
             attn_cosine = adaptive_rot_result["attn_cosine"]
+            layer_metrics = adaptive_rot_result["layer_metrics"]
             
             # Print strategy distribution
             strategy_counts = adaptive_rot_result["strategy_counts"]
@@ -606,10 +607,6 @@ def compress_and_compare(kv: dict):
                 hadamard_pct = 100.0 * strategy_counts[STRATEGY_HADAMARD] / total_vectors
                 outlier_pct = 100.0 * strategy_counts[STRATEGY_OUTLIER] / total_vectors
                 print(f"    Strategy dist: NONE={none_pct:.0f}%, HADAMARD={hadamard_pct:.0f}%, OUTLIER={outlier_pct:.0f}%")
-            
-            # Compute layer metrics for nonlinearity penalty (need to reconstruct k_hat/v_hat)
-            # For simplicity, skip detailed layer metrics for adaptive rotation
-            layer_metrics = {'nonlin_excluding_layer0': 1.0}
         elif mode.startswith("adaptive_"):
             # Layer-adaptive compression experiments
             if mode == "adaptive_l0":
@@ -865,6 +862,9 @@ def compress_adaptive_rotation(kv: dict, head_dim: int, stats_path: str = "per_h
     compressed_bits = n_vectors * (head_dim * bit_width + 32) + n_vectors * head_dim * bit_width  # K + norm + V
     compression_ratio = original_bits / compressed_bits
     
+    # Compute layer metrics for nonlinearity penalty using the same helper as other configs
+    _, layer_metrics = _compute_attn_cosine(k_cache, v_cache, k_hat, v_hat, head_dim)
+    
     return {
         "k_mse": k_mse,
         "v_mse": v_mse,
@@ -873,6 +873,7 @@ def compress_adaptive_rotation(kv: dict, head_dim: int, stats_path: str = "per_h
         "compression_ratio": compression_ratio,
         "strategy_counts": strategy_counts,
         "total_vectors": total_vectors,
+        "layer_metrics": layer_metrics,
     }
 
 
