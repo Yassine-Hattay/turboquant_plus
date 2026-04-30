@@ -395,7 +395,7 @@ def compress_and_compare_asymmetric(kv: dict, head_dim: int) -> dict:
     # Compressed K: 4 bits + 32/head_dim for norm per vector
     # Compressed V: 2 bits per vector
     n_vectors = num_layers * num_heads * seq_len
-    original_bits = n_vectors * head_dim * 32 * 2  # K + V
+    original_bits = n_vectors * head_dim * 16 * 2  # K + V (FP16 baseline to match uniform rows)
     compressed_bits = n_vectors * (head_dim * 4 + 32) + n_vectors * head_dim * 2  # K + norm + V
     compression_ratio = original_bits / compressed_bits
     
@@ -858,7 +858,7 @@ def compress_adaptive_rotation(kv: dict, head_dim: int, stats_path: str = "per_h
     
     # Compression ratio: K=bit_width bits + norm, V=bit_width bits (no extra norm for MSE-only)
     n_vectors = num_layers * num_heads * seq_len
-    original_bits = n_vectors * head_dim * 32 * 2  # K + V (fp32)
+    original_bits = n_vectors * head_dim * 16 * 2  # K + V (FP16 baseline to match uniform rows)
     compressed_bits = n_vectors * (head_dim * bit_width + 32) + n_vectors * head_dim * bit_width  # K + norm + V
     compression_ratio = original_bits / compressed_bits
     
