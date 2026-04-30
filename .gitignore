@@ -21,46 +21,15 @@ wheels/
 .installed.cfg
 *.egg
 
-# Compiled and build artifacts
-*.pyc
-*.pyo
-*.pyd
-*.so
-*.o
-*.obj
-*.out
-
-# Dependencies
-.venv/
-venv/
-.env
-.env.local
-.env.*
-node_modules/
-
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-
-# Editors
+# IDE
 .vscode/
 .idea/
 
-# Coverage
-.coverage
-coverage/
-htmlcov/
+# Logs
+*.log
 
-# MyPy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# PyTest
-.pytest_cache/
-
-# Benchmark artifacts
-benchmarks/__pycache__/
-turboquant/__pycache__/
+# Environment
+.env
+.env.local
+.env.*
 ```
