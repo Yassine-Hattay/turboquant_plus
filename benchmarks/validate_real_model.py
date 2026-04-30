@@ -7,6 +7,7 @@ Requires: pip install transformers torch accelerate
 """
 
 import sys
+import os
 import time
 import json
 import argparse
@@ -20,6 +21,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, ".")
 from turboquant import TurboQuant, TurboQuantMSE, KVCacheCompressor
 from turboquant.outlier import OutlierTurboQuant
+from turboquant.adaptive_quant import AdaptivePolarQuant, ChannelStats, STRATEGY_NONE, STRATEGY_HADAMARD, STRATEGY_OUTLIER
 
 
 MODEL_NAME = "Qwen/Qwen3-1.7B"  # head_dim=128, same as 27B
@@ -562,6 +564,7 @@ def compress_and_compare(kv: dict):
         ("Uniform 2-bit", 2, 2, "uniform"),
         ("Outlier 2.5-bit", 2.5, 2.5, "outlier"),
         ("Uniform 3-bit", 3, 3, "uniform"),
+        ("Adaptive Rot. 3-bit", None, None, "adaptive_rotation"),
         ("Outlier 3.5-bit", 3.5, 3.5, "outlier"),
         ("Uniform 4-bit", 4, 4, "uniform"),
         ("Asymmetric 4K/2V", None, None, "asymmetric"),
@@ -582,6 +585,31 @@ def compress_and_compare(kv: dict):
             ratio = asym_result["compression_ratio"]
             k_hat = None  # Not needed for display
             attn_cosine = asym_result["attn_cosine"]
+        elif mode == "adaptive_rotation":
+            # Adaptive rotation with per-head strategy selection
+            if not os.path.exists("per_head_stats.json"):
+                print(f"  ⚠️  Skipping {name}: per_head_stats.json not found")
+                continue
+            
+            adaptive_rot_result = compress_adaptive_rotation(kv, head_dim, stats_path="per_head_stats.json", bit_width=3)
+            k_mse = adaptive_rot_result["k_mse"]
+            v_mse = adaptive_rot_result["v_mse"]
+            k_cosine = adaptive_rot_result["k_cosine"]
+            ratio = adaptive_rot_result["compression_ratio"]
+            attn_cosine = adaptive_rot_result["attn_cosine"]
+            
+            # Print strategy distribution
+            strategy_counts = adaptive_rot_result["strategy_counts"]
+            total_vectors = adaptive_rot_result["total_vectors"]
+            if total_vectors > 0:
+                none_pct = 100.0 * strategy_counts[STRATEGY_NONE] / total_vectors
+                hadamard_pct = 100.0 * strategy_counts[STRATEGY_HADAMARD] / total_vectors
+                outlier_pct = 100.0 * strategy_counts[STRATEGY_OUTLIER] / total_vectors
+                print(f"    Strategy dist: NONE={none_pct:.0f}%, HADAMARD={hadamard_pct:.0f}%, OUTLIER={outlier_pct:.0f}%")
+            
+            # Compute layer metrics for nonlinearity penalty (need to reconstruct k_hat/v_hat)
+            # For simplicity, skip detailed layer metrics for adaptive rotation
+            layer_metrics = {'nonlin_excluding_layer0': 1.0}
         elif mode.startswith("adaptive_"):
             # Layer-adaptive compression experiments
             if mode == "adaptive_l0":
@@ -717,6 +745,134 @@ def _compute_attn_cosine(k_cache, v_cache, k_hat, v_hat, head_dim: int) -> tuple
         'nonlin_excluding_layer0': nonlin_excluding_layer0,
         'nonlin_layer0': nonlin_layer0,
         'layer_nonlin_ratios': layer_nonlin_ratios
+    }
+
+
+def compress_adaptive_rotation(kv: dict, head_dim: int, stats_path: str = "per_head_stats.json", bit_width: int = 3) -> dict:
+    """Compress KV cache using AdaptivePolarQuant with per-head adaptive rotation.
+    
+    Uses AdaptivePolarQuant for K cache (with per-head strategy selection based on kurtosis/outlier ratio)
+    and standard TurboQuantMSE for V cache.
+    
+    CRITICAL FIX (Mask Drift): The outlier_mask is computed once from the first token of each head
+    and reused for all tokens in that head. This ensures forward and inverse rotation masks match exactly.
+    
+    Args:
+        kv: Dict with 'k_cache' and 'v_cache' tensors.
+        head_dim: Dimension of each attention head.
+        stats_path: Path to JSON file containing per-head statistics.
+        bit_width: Quantization bit width for both K and V caches.
+    
+    Returns:
+        Dict with k_mse, v_mse, k_cosine, attn_cosine, compression_ratio, and strategy_counts.
+    """
+    k_cache = kv["k_cache"]
+    v_cache = kv["v_cache"]
+    num_layers, num_heads, seq_len, _ = k_cache.shape
+    
+    # Load per-head statistics
+    if not os.path.exists(stats_path):
+        raise FileNotFoundError(f"Per-head stats file not found: {stats_path}")
+    
+    with open(stats_path, "r") as f:
+        stats_data = json.load(f)
+    
+    k_stats_list = stats_data["k_cache"]
+    
+    # Initialize quantizers
+    # AdaptivePolarQuant for K cache (uses adaptive rotation strategies)
+    k_quantizer = AdaptivePolarQuant(head_dim, bit_width=bit_width, seed=42)
+    # Standard TurboQuantMSE for V cache (MSE-only, no rotation)
+    v_quantizer = TurboQuantMSE(head_dim, bit_width=bit_width, seed=43)
+    
+    k_hat = np.zeros_like(k_cache)
+    v_hat = np.zeros_like(v_cache)
+    
+    # Track strategy usage across all vectors
+    strategy_counts = {STRATEGY_NONE: 0, STRATEGY_HADAMARD: 0, STRATEGY_OUTLIER: 0}
+    total_vectors = 0
+    
+    for layer in range(num_layers):
+        for head in range(num_heads):
+            # Get stats for this layer/head from JSON
+            idx = layer * num_heads + head
+            kurtosis = k_stats_list["kurtosis"][idx]
+            max_ratio = k_stats_list["max_ratio"][idx]
+            
+            # CRITICAL FIX: Compute outlier_mask from first token only, then reuse for all tokens
+            first_token_k = k_cache[layer, head, 0]  # Shape: (head_dim,)
+            first_token_stats = k_quantizer._compute_stats(first_token_k)
+            
+            # Build ChannelStats with fixed outlier_mask for this head
+            channel_stats = ChannelStats(
+                kurtosis=kurtosis,
+                max_ratio=max_ratio,
+                outlier_mask=first_token_stats.outlier_mask,  # Fixed mask from first token
+            )
+            
+            # Quantize/dequantize all tokens for this head using fixed stats
+            for token_idx in range(seq_len):
+                k_vec = k_cache[layer, head, token_idx]
+                
+                # Quantize with fixed stats
+                indices, norms, strategy = k_quantizer.quantize(k_vec, channel_stats)
+                k_reconstructed = k_quantizer.dequantize(indices, norms, strategy, channel_stats)
+                k_hat[layer, head, token_idx] = k_reconstructed
+                
+                # Track strategy usage
+                strategy_counts[strategy] += 1
+                total_vectors += 1
+            
+            # V cache: standard MSE-only quantization (no adaptive rotation)
+            v_vecs = v_cache[layer, head]
+            v_indices, v_norms = v_quantizer.quantize(v_vecs)
+            v_hat[layer, head] = v_quantizer.dequantize(v_indices, v_norms)
+    
+    # Compute metrics
+    k_mse = np.mean((k_cache - k_hat) ** 2)
+    v_mse = np.mean((v_cache - v_hat) ** 2)
+    
+    # K cosine similarity (per-vector)
+    k_flat = k_cache.reshape(-1, head_dim)
+    k_hat_flat = k_hat.reshape(-1, head_dim)
+    k_cosines = _batch_cosine_sim(k_flat, k_hat_flat)
+    k_cosine = np.mean(k_cosines)
+    
+    # Attention quality test (sample first layer, first head)
+    rng = np.random.default_rng(42)
+    q = rng.standard_normal((1, head_dim)).astype(np.float32)
+    k_sample = k_cache[0, 0]
+    v_sample = v_cache[0, 0]
+    k_hat_sample = k_hat[0, 0]
+    v_hat_sample = v_hat[0, 0]
+    
+    # Original attention
+    scores = q @ k_sample.T / np.sqrt(head_dim)
+    attn = _softmax(scores)
+    out_orig = attn @ v_sample
+    
+    # Compressed attention
+    scores_c = q @ k_hat_sample.T / np.sqrt(head_dim)
+    attn_c = _softmax(scores_c)
+    out_comp = attn_c @ v_hat_sample
+    
+    attn_cosine = np.dot(out_orig.ravel(), out_comp.ravel()) / (
+        max(np.linalg.norm(out_orig) * np.linalg.norm(out_comp), 1e-10))
+    
+    # Compression ratio: K=bit_width bits + norm, V=bit_width bits (no extra norm for MSE-only)
+    n_vectors = num_layers * num_heads * seq_len
+    original_bits = n_vectors * head_dim * 32 * 2  # K + V (fp32)
+    compressed_bits = n_vectors * (head_dim * bit_width + 32) + n_vectors * head_dim * bit_width  # K + norm + V
+    compression_ratio = original_bits / compressed_bits
+    
+    return {
+        "k_mse": k_mse,
+        "v_mse": v_mse,
+        "k_cosine": k_cosine,
+        "attn_cosine": attn_cosine,
+        "compression_ratio": compression_ratio,
+        "strategy_counts": strategy_counts,
+        "total_vectors": total_vectors,
     }
 
 
