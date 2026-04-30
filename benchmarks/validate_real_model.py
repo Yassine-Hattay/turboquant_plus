@@ -520,7 +520,7 @@ def compress_layer_adaptive_with_output(kv: dict, head_dim: int, protected_layer
     bits_per_vector_protected = head_dim * protected_bits + 32 + head_dim * protected_bits
     bits_per_vector_base = head_dim * base_bits + 32 + head_dim * base_bits
     
-    original_bits = num_layers * n_vectors_per_layer * head_dim * 32 * 2  # K + V fp32
+    original_bits = num_layers * n_vectors_per_layer * head_dim * 16 * 2  # K + V (FP16 baseline to match uniform rows)
     compressed_bits = protected_vectors * bits_per_vector_protected + base_vectors * bits_per_vector_base
     compression_ratio = original_bits / compressed_bits
     
