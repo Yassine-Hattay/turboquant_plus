@@ -208,35 +208,18 @@ def save_and_plot_stats(stats: dict, output_path: str = "per_head_stats.json"):
         return False
 
 
-def load_model(device: str = "auto"):
-    """Load model and tokenizer.
-    
-    Args:
-        device: Device to load model on. Options: "auto", "cuda", "mps", "cpu".
-                "auto" will automatically detect CUDA > MPS > CPU.
-    """
-    # Auto-detect device if not specified
-    if device == "auto":
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-    
-    # Use FP16 on GPU for speed/memory, FP32 on CPU for accuracy baseline
-    torch_dtype = torch.float16 if device != "cpu" else torch.float32
-    
-    print(f"Loading {MODEL_NAME} on {device} with dtype={torch_dtype}...")
+def load_model():
+    """Load model and tokenizer."""
+    print(f"Loading {MODEL_NAME}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        dtype=torch_dtype,
-        device_map=device,  # GPU-accelerated inference
+        dtype=torch.float32,  # fp32 for accuracy baseline
+        device_map="cpu",  # CPU is fine for validation
         trust_remote_code=True,
     )
     model.eval()
-    print(f"  Loaded: {sum(p.numel() for p in model.parameters()) / 1e6:.0f}M params on {model.device}")
+    print(f"  Loaded: {sum(p.numel() for p in model.parameters()) / 1e6:.0f}M params")
     return model, tokenizer
 
 
@@ -247,8 +230,6 @@ def extract_kv_cache(model, tokenizer, prompt: str) -> dict:
         Dict with 'k_cache' and 'v_cache', each shape (num_layers, num_kv_heads, seq_len, head_dim)
     """
     inputs = tokenizer(prompt, return_tensors="pt")
-    # Move inputs to model's device for GPU inference
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = model(**inputs, use_cache=True)
 
@@ -288,8 +269,6 @@ def extract_kv_cache_after_generation(model, tokenizer, prompt: str, max_new_tok
         where seq_len includes both prompt tokens and generated tokens.
     """
     inputs = tokenizer(prompt, return_tensors="pt")
-    # Move inputs to model's device for GPU inference
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
     input_len = inputs["input_ids"].shape[1]
     
     with torch.no_grad():
@@ -1062,11 +1041,9 @@ def niah_test_standardized(model, tokenizer, target_tokens: int = 4096,
             formatted = f"User: {context_text}\n{query}\nAssistant:"
         
         inputs = tokenizer(formatted, return_tensors="pt")
-        # Move inputs to model's device for GPU inference
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
         input_len = inputs["input_ids"].shape[1]
         
-        print(f"\n  🧵 Processing depth {depth*100:.0f}%...", flush=True)
+        print(f"\n  🧵 Processing depth {depth*100:.0f}%... (CPU gen takes ~1 min)", flush=True)
         with torch.no_grad():
             outputs = model.generate(
                 **inputs, max_new_tokens=20, do_sample=False, top_p=1.0
