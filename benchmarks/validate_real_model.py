@@ -1043,9 +1043,10 @@ def niah_test_standardized(model, tokenizer, target_tokens: int = 4096,
         inputs = tokenizer(formatted, return_tensors="pt")
         input_len = inputs["input_ids"].shape[1]
         
+        print(f"\n  🧵 Processing depth {depth*100:.0f}%... (CPU gen takes ~1 min)", flush=True)
         with torch.no_grad():
             outputs = model.generate(
-                **inputs, max_new_tokens=50, do_sample=False, temperature=0.0, top_p=1.0
+                **inputs, max_new_tokens=20, do_sample=False, top_p=1.0
             )
         response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
         
