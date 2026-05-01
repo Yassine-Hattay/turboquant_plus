@@ -1,1 +1,21 @@
-Nothing needs to be added to the .gitignore file based on the provided changes. The only modified file is 'benchmarks/validate_real_model.py', which is a Python source code file and should not be ignored. There are no build artifacts, dependencies, or temporary files in the change list that require ignoring.
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build artifacts
+build/
+dist/
+*.so
+*.egg-info/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+.env.*
+```
